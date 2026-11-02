@@ -10,6 +10,7 @@ import {
   formatStatusReport,
   globalConfigPath,
   loadConfig,
+  lintRules,
   loadFileConfig,
   mergeFileConfigs,
   projectConfigPath,
@@ -27,6 +28,11 @@ describe("resolveConfig", () => {
     assert.ok(config.allow.includes("shell:tail *"));
     assert.ok(config.allow.includes("mcp:docs-mcp-server"));
     assert.deepEqual(config.deny, []);
+  });
+  it("defaults never auto-allow commands that can write or run other programs", () => {
+    // `find -exec/-delete`; Pi's own read-only `find` tool needs no shell rule.
+    assert.ok(!DEFAULT_ALLOW.some((rule) => /^shell:(find|xargs|sudo|env|bash|sh|eval)\b/.test(rule)));
+    assert.deepEqual(lintRules({ allow: DEFAULT_ALLOW, deny: [] }), []);
   });
   it("keeps explicit lists as-is", () => {
     const config = resolveConfig({ allow: ["shell:git pull *"], deny: ["shell:rm -rf *"], enabled: false });
@@ -141,11 +147,68 @@ describe("loadConfig", () => {
     assert.equal(config.warnings.length, 1);
     assert.match(config.warnings[0], /not trusted/);
   });
+  it("warns about path rules that use the shell-only trailing \" *\" shorthand", () => {
+    writeProject({ allow: ["edit:tmp *"], deny: ["edit:src *"] });
+    const config = load(true);
+    assert.equal(config.warnings.length, 2);
+    assert.match(config.warnings[0], /allow rule "edit:tmp \*".*edit:tmp\/\*/);
+    assert.match(config.warnings[1], /deny rule "edit:src \*".*edit:src\/\*/);
+  });
+  it("does not warn about path rules that really use a separator", () => {
+    writeProject({ allow: ["edit:tmp/*", "edit:tmp", "edit:*"], deny: [] });
+    assert.deepEqual(load(true).warnings, []);
+  });
   it("an invalid global file disables the defaults instead of widening access", () => {
     writeGlobal("{oops");
     const config = load(true);
     assert.deepEqual(config.allow, []);
     assert.equal(config.warnings.length, 1);
+  });
+});
+
+describe("lintRules", () => {
+  it("keeps usable rules quiet", () => {
+    const quiet = [
+      "shell:git pull *",
+      "bash:git status *", // accepted spelling of the shell scope
+      "powershell:Get-Item *",
+      "edit:ok/*",
+      "edit:*",
+      "write:tmp/*", // accepted spelling of the edit scope
+      "edit",
+      "mcp:docs",
+      "mcp:docs:*",
+      "mcp:srv:get_*",
+      "edit:My Docs/*", // a space that is not the trailing " *" is just part of the name
+      "edit:my file *.txt",
+      "mcp:my server", // Pi turns the space into "_" for names too
+      "my-tool",
+      "my-tool:*",
+      "mcp__srv__tool", // exact Pi tool name
+      "",
+    ];
+    assert.deepEqual(lintRules({ allow: quiet, deny: quiet }), []);
+  });
+  it("flags the shell-only \" *\" shorthand in non-shell scopes, in both lists", () => {
+    const warnings = lintRules({ allow: ["edit:docs *"], deny: ["edit:*secret* *"] });
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[0], /^allow rule "edit:docs \*" never matches a file path/);
+    assert.match(warnings[0], /edit:docs\/\*/);
+    assert.match(warnings[1], /^deny rule "edit:\*secret\* \*"/);
+    assert.match(lintRules({ allow: ["write:tmp *"], deny: [] })[0], /write:tmp\/\*/);
+  });
+  it("flags MCP and tool rules that do not do what they look like", () => {
+    const warnings = lintRules({ allow: ["mcp:docs *", "my-tool:foo*", "mcp:a:b *"], deny: [] });
+    assert.equal(warnings.length, 3);
+    assert.match(warnings[0], /reads the space as "_".*did you mean "mcp:docs"\?/);
+    assert.match(warnings[1], /yields no resources; use "my-tool"/);
+    assert.match(warnings[2], /did you mean "mcp:a:b"\?/);
+  });
+  it("flags a rule that forgot its scope prefix, suggesting shell:", () => {
+    const warnings = lintRules({ allow: ["git status *", "npm run build"], deny: ["rm -rf *"] });
+    assert.equal(warnings.length, 3);
+    assert.match(warnings[0], /^allow rule "git status \*" has no scope.*"shell:git status \*"/);
+    assert.match(warnings[2], /^deny rule "rm -rf \*".*"shell:rm -rf \*"/);
   });
 });
 

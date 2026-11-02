@@ -11,7 +11,7 @@
  * - read-only tools (`read`, `grep`, `find`, `ls`, MCP resource tools, …) →
  *   never touched
  *
- * Rule syntax (`scope:pattern`, core-like `*`/`?` wildcards) is documented in
+ * Rule syntax (`scope:pattern`, `*`/`?` wildcards) is documented in
  * `policy.ts`. `edit:<pattern>` covers both `edit` and `write`; `shell:<…>`
  * covers `bash` and `powershell`; `mcp:<server>` and `mcp:<server>:<tool>`
  * cover MCP servers and specific tools.
@@ -38,8 +38,8 @@ import {
 import { classifyPath } from "./paths.ts";
 import {
   evaluate,
+  hasHeredoc,
   mcpPartsOf,
-  mcpServerOf,
   normalizeCustomRule,
   shellKindOf,
   splitCommands,
@@ -78,11 +78,12 @@ function targetOf(event: ToolCallEvent, cwd: string): CallTarget {
   const input = event.input as Record<string, unknown>;
   if (event.toolName === "bash" || event.toolName === "powershell") {
     const command = String(input.command ?? "");
-    return {
-      resources: splitCommands(command, shellKindOf(event.toolName)),
-      outside: false,
-      hint: command.includes(">") ? "contains a redirection" : undefined,
-    };
+    const shell = shellKindOf(event.toolName);
+    // Same triggers as `evaluate()`: these calls ask whatever the allowlist says.
+    let hint: string | undefined;
+    if (command.includes(">")) hint = "contains a redirection";
+    else if (hasHeredoc(command, shell)) hint = shell === "powershell" ? "contains a here-string" : "contains a heredoc";
+    return { resources: splitCommands(command, shell), outside: false, hint };
   }
   if (event.toolName === "edit" || event.toolName === "write") {
     const { resource, outside } = classifyPath(String(input.path ?? ""), cwd);
@@ -188,7 +189,7 @@ export default function allowlistGate(pi: ExtensionAPI): void {
       return block(`Blocked by ${EXTENSION_NAME}: ${call}${where} requires approval (no UI available)`);
     }
 
-    // A hint means the call asks regardless of the allowlist (redirection,
+    // A hint means the call asks regardless of the allowlist (redirection, heredoc,
     // outside the project): a saved rule could never take effect, so don't offer it.
     const options = [ALLOW_ONCE, ALLOW_SESSION];
     if (ctx.isProjectTrusted() && !hint) options.push(ALLOW_SAVE);

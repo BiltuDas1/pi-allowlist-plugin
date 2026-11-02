@@ -38,13 +38,14 @@ extensions/
     policy.ts   → pure allowlist/denylist matching, `splitCommands()` (no external dependencies)
     paths.ts    → pure path normalization + inside/outside-project classification
     config.ts   → configuration resolution (JSON files), status report, `saveProjectRules()`,
-                  fail-safe loading
+                  fail-safe loading, `lintRules()` (warnings for rules that can never match)
 test/
   policy.test.ts  → pure matching: wildcards, splitCommands (bypass regressions, posix/powershell),
-                    shell/edit/MCP/generic, deny-wins, forceAsk, passthrough
+                    comments/`$'…'`/heredoc regressions, shell/edit/MCP/generic, deny-wins,
+                    forceAsk, passthrough
   paths.test.ts   → `~`/`@`/`../`/absolute normalization, inside vs outside the project
   config.test.ts  → file resolution, global+project merge, trust, fail-safe on invalid files,
-                    status report, saveProjectRules (seeding, inheritance, no overwrite)
+                    status report, saveProjectRules (seeding, inheritance, no overwrite), lintRules
   gate.test.ts    → handler wiring with fake Pi API/UI: allow/ask/deny, session approvals,
                     serialized dialogs, outside-project, redirections, MCP, trust, disabled gate,
                     /allowlist command, "Allow & save rule" flow
@@ -80,7 +81,10 @@ Rule syntax is `scope:pattern` with wildcards (`*`, `?`):
   scanner: separators `&&` `||` `;` `|` `&`, newlines and parentheses; `$(…)` and (posix only)
   backticks are scanned recursively, **also inside double quotes**, so inner commands become
   segments of their own while the outer segment keeps the raw text; quotes and the dialect's
-  escape char (`\` for posix, backtick for PowerShell) are honored.
+  escape char (`\` for posix, backtick for PowerShell) are honored. Text the shell treats as inert
+  is consumed verbatim — comments (`#` only at the **start of a word**, tracked by `wordStart`;
+  PowerShell `<# … #>`) and posix `$'…'` (where `\'` is an escaped quote) — because a quote char
+  inside it would otherwise open a phantom string swallowing the following commands.
   **Invariant: the splitter may only err towards splitting more** — an under-split command can
   slip past an allowlist or evade a deny rule. Add a regression test for every bypass found.
   Wrappers (`bash -c`, `sudo`, `env`, `xargs`, `eval`) are deliberately not unwrapped
@@ -99,12 +103,27 @@ Rule syntax is `scope:pattern` with wildcards (`*`, `?`):
   cover the whole tool, anything unlisted asks. Pattern rules never match (no resources derived).
 - A rule without `:` means whole-action (e.g. `bash`).
 
+`lintRules()`/`lintRule()` in `config.ts` warn (never rewrite) about rules that will not do what
+they look like: the shell-only trailing ` *` shorthand in an `edit`/`mcp`/generic rule (only the
+*trailing* one is special), patterns on generic tools (which derive no resources), and a missing
+scope prefix (`git status *` → suggest `shell:git status *`). Warnings reach the user once via
+`ctx.ui.notify` and appear in `/allowlist`.
+
 Precedence: **deny wins over allow, allow wins over ask.**
+
+**Default allowlist** (`DEFAULT_ALLOW`, `config.ts`): only commands that can neither write nor run
+another program. Never add `find` (`-exec`, `-delete`), `xargs`, `sudo`, `env`, `sh`/`bash`, `eval`;
+`rg --pre` and `git diff --output` are known residual gaps of `rg -n *` / `git diff *`. Pi's own
+`find` tool is read-only passthrough, so file discovery needs no shell rule. Defaults only seed the
+global file at creation; existing files are never rewritten (tell the user to edit by hand).
 
 Outside-project `edit`/`write` targets always ask, no matter the allowlist — only the denylist can
 hard-block them (`evaluate(..., { forceAsk: true })`; deny is checked first). Same for shell
 commands containing a redirection (`>`): they can write files, so they always ask (deliberately
-coarse, quoted `>` included). Known gaps (documented for users): absolute outside paths *inside*
+coarse, quoted `>` included). Same again for **heredocs** (`<<`) and PowerShell here-strings
+(`@'`/`@"`), see `hasHeredoc()`: the splitter does not parse their bodies, so a quote inside one
+could hide the commands after it — asking is the only safe answer. `targetOf()` and `evaluate()`
+must keep the same triggers (the dialog `hint` hides "Allow & save" because a rule could not help). Known gaps (documented for users): absolute outside paths *inside*
 an in-project shell command, and symlinks pointing outside, are not detectable.
 
 Read-only passthrough (`SAFE_PASSTHROUGH`): `read grep find ls question codemode tool_search` plus
@@ -121,8 +140,8 @@ them. Inside the queue the call is re-checked against the session set **and agai
 loaded config**, so a sibling call covered by an approval or a rule saved meanwhile does not ask twice.
 
 **"Allow & save rule (project)..."** (`saveRules()` in `index.ts`, `saveProjectRules()` in `config.ts`):
-- Offered only if `ctx.isProjectTrusted()` **and** the ask has no `hint` — redirections and
-  outside-project targets ask regardless of the allowlist, so a saved rule would be useless.
+- Offered only if `ctx.isProjectTrusted()` **and** the ask has no `hint` — redirections, heredocs
+  and outside-project targets ask regardless of the allowlist, so a saved rule would be useless.
 - Uses `ctx.ui.editor(title, prefill)` (multi-line, **really prefilled**; `ctx.ui.input` only has a
   placeholder). One rule per line, the **complete** resource — never shortened or wildcarded by us.
   The policy matches per sub-command, so a compound command yields one `shell:` rule per segment

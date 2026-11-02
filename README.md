@@ -173,8 +173,13 @@ review project package declarations before trusting a folder.
 ## Rule syntax
 
 Rules are strings of the form `scope:pattern`. Patterns use the wildcards `*` (anything) and
-`?` (one character). A trailing ` *` also matches the bare command (`shell:git pull *` matches
-`git pull` and `git pull origin main`). On Windows matching is case-insensitive.
+`?` (one character). In `shell` rules a trailing ` *` also matches the bare command
+(`shell:git pull *` matches `git pull` and `git pull origin main`). On Windows matching is
+case-insensitive.
+
+> The trailing ` *` shorthand is **for commands only**: a path, a server or a tool name has no
+> arguments, so `edit:tmp *` matches a *name containing a space*, never the folder. Write
+> `edit:tmp/*` instead. Such rules are reported as warnings (see `/allowlist`).
 
 | Rule | Covers | Matched against |
 |---|---|---|
@@ -191,7 +196,8 @@ A rule without `:` means the whole tool. Examples: `shell:git pull *`, `edit:doc
 
 The command line is split into sub-commands at `&&`, `||`, `;`, `|`, `&`, newlines and
 parentheses. Commands inside `$(…)` and backticks are extracted too, including inside double
-quotes. Quotes and the shell's escape character are respected. Then:
+quotes. Quotes, the shell's escape character and comments (`# …`, PowerShell `<# … #>`) are
+respected. Then:
 
 - **allow** requires **every** sub-command to match an allow rule
   (`git status && git push` is not covered by `shell:git status *`);
@@ -202,12 +208,20 @@ so it asks even if the command is allowlisted (`shell:echo *` passes `echo x` bu
 asks). The check is deliberately coarse: a `>` inside quotes or `2>&1` also asks. Only the
 denylist can hard-block such a command.
 
+**Heredocs and here-strings always ask.** A posix heredoc (`<<`) or a PowerShell here-string
+(`@'` / `@"`) embeds free text the gate cannot reliably delimit, so — like a redirection — the
+call asks even if the command is allowlisted (`cat <<EOF …`). It cannot be allowlisted away and
+"Allow & save rule" is not offered for it; only the denylist can hard-block it.
+
 ### File edits
 
 `edit:<pattern>` is matched against the path **relative to the project** (`/` separators),
 whatever spelling the model used (`./docs/a.md`, an absolute path inside the project, `@docs/a.md`
 all become `docs/a.md`). Note `*` also matches `/`, and patterns are anchored at the start:
 `edit:.env*` covers `.env` but not `sub/.env` — use `edit:*.env*` for that.
+
+To cover a folder, separate it with a `/` and no space: `edit:tmp/*` (covers `tmp/a.ts` and
+`tmp/a/b.ts`), **not** `edit:tmp *`.
 
 **Targets outside the project always ask**, no matter the allowlist (`../x`, absolute paths,
 `~/…`). Only the denylist can hard-block them; write such patterns as absolute paths with
@@ -276,14 +290,23 @@ gate runs**, so the user finds it ready to edit.
 The files are re-read on every tool call, so edits apply immediately (no `/reload`).
 
 **Defaults** (used for any list the files do not define): allow
-`git status/diff/log`, `ls`, `cat`, `pwd`, `echo`, `wc`, `grep`, `tail`, `rg -n`, `find`,
-`head -n`, `pi mcp list` and `mcp:docs-mcp-server`; deny nothing.
+`git status/diff/log`, `ls`, `cat`, `pwd`, `echo`, `wc`, `grep`, `tail`, `rg -n`,
+`head -n`, `pi mcp list` and `mcp:docs-mcp-server`; deny nothing. The shell `find` is deliberately
+not included (`find -exec rm …` / `-delete` would run unasked); Pi's read-only `find` tool is
+never gated anyway. The defaults seed the global file only when it is created: an existing file
+is never modified, so remove `shell:find *` by hand if your file already has it.
 An explicit `"allow": []` disables the default allowlist.
 
 **Fail-safe loading.** An invalid file never widens access: it is treated as `{"allow": []}`
 (nothing is auto-allowed, everything gated asks) and a warning is shown once. A project file in
 an untrusted project is ignored, with a warning — otherwise a cloned repository could allow
 itself everything.
+
+**Rule warnings.** Rules that can never match are reported too (once, and in `/allowlist`) instead
+of being rewritten, because a silent rewrite could widen your permissions: the shell-only ` *`
+shorthand in a non-shell rule (`edit:tmp *` → use `edit:tmp/*`), a pattern on a tool whose input
+carries no resources (`my-tool:foo` → use `my-tool`), and a rule with no scope at all
+(`git status *` → use `shell:git status *`). The rule is still applied as written.
 
 ### "Allow for session"
 
@@ -316,7 +339,7 @@ shell:git commit -m "wip"
 - A project file that cannot be parsed is **never overwritten**: the call you approved runs once,
   an error explains why nothing was saved, and the file is left for you to fix.
 - Not offered in **untrusted** projects, nor for calls that ask regardless of the allowlist
-  (shell redirections, targets outside the project): a saved rule could not change the outcome.
+  (shell redirections, heredocs, targets outside the project): a saved rule could not change the outcome.
 - Limitation: rules are one line each, so a sub-command with a newline inside quotes cannot be
   saved as a working rule; use "Allow for session" for those.
 
@@ -331,7 +354,8 @@ current project directory:
 - **Deny rules**: full list of effective deny rules
 - **Allow rules**: full list of effective allow rules
 - **Session approvals**: count and details of tool calls approved via "Allow for session" in the current session
-- **Warnings**: any JSON syntax errors or ignored files
+- **Warnings**: any JSON syntax errors, ignored files, and rules that can never match (e.g.
+  `edit:tmp *` instead of `edit:tmp/*`)
 
 Configuration is resolved live, so changes to config files are reflected immediately.
 

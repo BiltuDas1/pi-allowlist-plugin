@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "allow": [
+    "shell:git status *",
+    "shell:git diff *",
+    "shell:git log *",
+    "shell:ls *",
+    "shell:cat *",
+    "shell:pwd *",
+    "shell:echo *",
+    "shell:wc *",
+    "shell:grep *",
+    "shell:tail *",
+    "mcp:docs-mcp-server",
+    "shell:cd *",
+    "shell:head *",
+    "shell:sed *",
+    "shell:grep -n *"
+  ],
+  "deny": []
+}
