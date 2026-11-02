@@ -167,6 +167,25 @@ describe("allowlist gate", () => {
       assert.equal(uiCtx.ui.selectCalls.length, 1);
       assert.match(uiCtx.ui.selectCalls[0].title, /redirection/);
     });
+
+    it("heredocs ask even for allowlisted commands, say why, and cannot be saved as a rule", async () => {
+      const uiCtx = makeCtx(cwd, true);
+      uiCtx.ui.nextChoice = "Deny";
+      // `cat` is allowlisted by default; the body hides a second command behind an apostrophe.
+      const result = await handler(bash("cat <<'EOF'\nls x'\nEOF\nrm -rf 'y'"), uiCtx);
+      assert.equal(result?.block, true);
+      assert.equal(uiCtx.ui.selectCalls.length, 1);
+      assert.match(uiCtx.ui.selectCalls[0].title, /heredoc/);
+      assert.ok(!uiCtx.ui.selectCalls[0].options.includes("Allow & save rule (project)..."));
+    });
+
+    it("a comment with an apostrophe cannot smuggle a command past the allowlist", async () => {
+      const uiCtx = makeCtx(cwd, true);
+      uiCtx.ui.nextChoice = "Deny";
+      const result = await handler(bash("ls # it's\nrm -rf x"), uiCtx);
+      assert.equal(result?.block, true);
+      assert.equal(uiCtx.ui.selectCalls.length, 1);
+    });
   });
 
   describe("approval dialog", () => {
@@ -488,6 +507,17 @@ describe("allowlist gate", () => {
       assert.equal(uiCtx.ui.notifications.length, 1);
       assert.match(uiCtx.ui.notifications[0], /cannot be read/);
     });
+
+    it("warns once about a path rule that can never match, and still asks", async () => {
+      writeGlobalConfig({ allow: ["edit:tmp *"] });
+      const uiCtx = makeCtx(cwd, true);
+      uiCtx.ui.nextChoice = "Deny";
+      const edit = makeEvent("edit", { path: join(cwd, "tmp", "a.ts") });
+      assert.equal((await handler(edit, uiCtx))?.block, true);
+      await handler(edit, uiCtx);
+      assert.equal(uiCtx.ui.notifications.length, 1);
+      assert.match(uiCtx.ui.notifications[0], /edit:tmp \*.*edit:tmp\/\*/);
+    });
   });
 
   describe("/allowlist command", () => {
@@ -560,6 +590,17 @@ describe("allowlist gate", () => {
       await cmd.handler("", ctx);
       const report = ctx.ui.notifications[0];
       assert.match(report, /Allowlist Gate:\s*DISABLED/);
+    });
+
+    it("shows rule warnings about rules that can never match", async () => {
+      writeGlobalConfig({ allow: ["edit:tmp *"] });
+      const cmd = commands.get("allowlist");
+      assert.ok(cmd);
+      await cmd.handler("", ctx);
+      const report = ctx.ui.notifications[0];
+      assert.match(report, /Warnings:/);
+      assert.match(report, /never matches a file path/);
+      assert.match(report, /edit:tmp\/\*/);
     });
 
     it("shows config warnings when JSON is invalid", async () => {

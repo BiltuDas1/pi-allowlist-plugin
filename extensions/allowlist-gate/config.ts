@@ -25,7 +25,8 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { RuleLists } from "./policy.ts";
+import { EDIT_TOOLS, SHELL_TOOLS, parseRule } from "./policy.ts";
+import type { ParsedRule, RuleLists } from "./policy.ts";
 
 export const CONFIG_FILE_NAME = "allowlist-gate.json";
 
@@ -47,7 +48,11 @@ export interface LoadedFile {
   warning?: string;
 }
 
-/** Built-in allowlist, used as the default and as the seed for a new global file. */
+/**
+ * Built-in allowlist, used as the default and as the seed for a new global file.
+ * Only commands that cannot write or run other programs belong here: no `find`
+ * (`-exec`, `-delete`); Pi's own read-only `find` tool covers file discovery.
+ */
 export const DEFAULT_ALLOW: string[] = [
   "shell:git status *",
   "shell:git diff *",
@@ -61,7 +66,6 @@ export const DEFAULT_ALLOW: string[] = [
   "shell:tail *",
   "mcp:docs-mcp-server",
   "shell:rg -n *",
-  "shell:find *",
   "shell:head -n *",
   "shell:pi mcp list"
 ];
@@ -145,6 +149,53 @@ export function projectConfigPath(cwd: string, configDirName: string): string {
   return join(cwd, configDirName, CONFIG_FILE_NAME);
 }
 
+/** Tool names are made of these; anything else in a scope is a forgotten prefix. */
+const TOOL_NAME = /^[A-Za-z0-9_.-]+$/;
+
+/**
+ * Why a rule will not do what it looks like, or `undefined` when it looks
+ * usable. The trailing ` *` shorthand only means "and its arguments" for
+ * `shell`: a path, a server name or a tool name contains no arguments, so
+ * `edit:tmp *` matches the literal name `tmp` plus a space and silently asks
+ * forever. Reported as a warning — rules are never reinterpreted, that could
+ * widen access behind the user's back.
+ */
+function lintRule(rule: ParsedRule, raw: string): string | undefined {
+  // `bash:…` / `write:…` are accepted spellings of the shared scopes.
+  if (rule.scope === "shell" || SHELL_TOOLS.has(rule.scope)) return undefined;
+  // Only the trailing " *" is special (see wildcardMatch); a space elsewhere is just a name.
+  const trailingStar = /\s\*$/.test(rule.pattern);
+  const withoutStar = rule.pattern.replace(/\s+\*$/, "");
+  if (rule.scope === "edit" || EDIT_TOOLS.has(rule.scope)) {
+    if (!trailingStar) return undefined;
+    return `never matches a file path: the space is literal, so it only matches a name containing one; write "${rule.scope}:${withoutStar}/*" to cover a folder`;
+  }
+  if (rule.scope === "mcp") {
+    if (!trailingStar) return undefined;
+    return `reads the space as "_", so it only matches names like "${withoutStar}_…"; MCP names take no arguments, did you mean "mcp:${withoutStar}"?`;
+  }
+  if (!TOOL_NAME.test(rule.scope)) {
+    return `has no scope: "${rule.scope}" is neither shell:/edit:/mcp: nor a tool name; did you mean "shell:${raw.trim()}"?`;
+  }
+  if (trailingStar) return `never matches tool "${rule.scope}": only whole-tool rules ("${rule.scope}" or "${rule.scope}:*") can match`;
+  if (rule.pattern !== "*") return `never matches tool "${rule.scope}": its input yields no resources; use "${rule.scope}" to cover the whole tool`;
+  return undefined;
+}
+
+/** Warnings for every rule in both lists that can never match (see {@link lintRule}). */
+export function lintRules(lists: RuleLists): string[] {
+  const warnings: string[] = [];
+  for (const key of ["allow", "deny"] as const) {
+    for (const raw of lists[key] ?? []) {
+      const rule = parseRule(raw);
+      if (!rule) continue;
+      const hint = lintRule(rule, raw);
+      if (hint) warnings.push(`${key} rule "${raw}" ${hint}`);
+    }
+  }
+  return warnings;
+}
+
 export interface LoadConfigOptions {
   cwd: string;
   agentDir: string;
@@ -171,7 +222,9 @@ export function loadConfig(options: LoadConfigOptions): GateConfig {
   }
 
   const merged = mergeFileConfigs(globalFile.config, projectConfig);
-  return { ...resolveConfig(merged), warnings };
+  const resolved = resolveConfig(merged);
+  warnings.push(...lintRules(resolved));
+  return { ...resolved, warnings };
 }
 
 export interface StatusReportOptions {

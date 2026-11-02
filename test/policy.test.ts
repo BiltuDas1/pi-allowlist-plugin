@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   evaluate,
+  hasHeredoc,
   mcpPartsOf,
   mcpServerOf,
   normalizeCustomRule,
@@ -111,6 +112,28 @@ describe("splitCommands", () => {
     assert.deepEqual(splitCommands("echo `;x", "powershell"), ["echo `;x"]);
     assert.ok(splitCommands("echo $(Get-Date; Remove-Item x)", "powershell").includes("Remove-Item x"));
   });
+  // Regressions: a quote char inside text the shell ignores must not open a phantom
+  // string that swallows the commands after it (an under-split lets them ride an allow rule).
+  it("a comment is inert: an apostrophe or quote in it does not swallow the next line", () => {
+    assert.deepEqual(splitCommands("ls # it's\nrm -rf x"), ["ls # it's", "rm -rf x"]);
+    assert.deepEqual(splitCommands('ls # say "hi\nrm -rf x'), ['ls # say "hi', "rm -rf x"]);
+    assert.deepEqual(splitCommands("ls;# c\nrm x"), ["ls", "# c", "rm x"]);
+    assert.deepEqual(splitCommands("echo a #b; c"), ["echo a #b; c"]); // `;` is inside the comment
+  });
+  it("# only starts a comment at the start of a word", () => {
+    assert.deepEqual(splitCommands("echo a#b; rm x"), ["echo a#b", "rm x"]);
+    assert.deepEqual(splitCommands("echo $#; rm x"), ["echo $#", "rm x"]);
+    assert.deepEqual(splitCommands("echo a\\ #b; rm x"), ["echo a\\ #b", "rm x"]); // escaped space
+    assert.deepEqual(splitCommands("echo '#'; rm x"), ["echo '#'", "rm x"]);
+  });
+  it("posix $'…' strings honor \\' as an escaped quote", () => {
+    assert.deepEqual(splitCommands("echo $'it\\'s'; rm -rf x"), ["echo $'it\\'s'", "rm -rf x"]);
+    assert.deepEqual(splitCommands("echo 'a'; rm x"), ["echo 'a'", "rm x"]); // plain quotes unchanged
+  });
+  it("powershell: <# … #> block comments are inert", () => {
+    assert.deepEqual(splitCommands("ls <# it's #>; rm -rf x", "powershell"), ["ls <# it's #>", "rm -rf x"]);
+    assert.deepEqual(splitCommands("ls # it's\nrm x", "powershell"), ["ls # it's", "rm x"]);
+  });
   it("maps tool names to dialects", () => {
     assert.equal(shellKindOf("powershell"), "powershell");
     assert.equal(shellKindOf("bash"), "posix");
@@ -176,6 +199,32 @@ describe("evaluate: shell redirections always ask", () => {
   it("cannot be allowlisted away, but the denylist still wins", () => {
     assert.equal(evaluate("bash", ["echo x > file"], { allow: ["shell:*"], deny: [] }).decision, "ask");
     assert.equal(evaluate("bash", ["rm -rf /x > log"], lists).decision, "deny");
+  });
+});
+
+describe("evaluate: heredocs and here-strings always ask", () => {
+  const lists = { allow: ["shell:cat *", "shell:ls *", "shell:echo *"], deny: ["shell:rm -rf *"] };
+  it("a heredoc body cannot hide commands from the allowlist", () => {
+    // The body is inert for the shell, but the splitter cannot tell where it ends.
+    const command = "cat <<'EOF'\nls x'\nEOF\nrm -rf 'y'";
+    assert.equal(evaluate("bash", splitCommands(command), lists).decision, "ask");
+    assert.equal(evaluate("bash", ["cat <<EOF"], lists).decision, "ask");
+  });
+  it("cannot be allowlisted away, but the denylist still wins", () => {
+    assert.equal(evaluate("bash", ["cat <<EOF"], { allow: ["shell:*"], deny: [] }).decision, "ask");
+    assert.equal(evaluate("bash", ["rm -rf x <<EOF"], lists).decision, "deny");
+  });
+  it("powershell here-strings ask, plain quoting does not", () => {
+    assert.equal(evaluate("powershell", splitCommands("echo @'\nls x'\n'@\nrm -rf 'y'", "powershell"), lists).decision, "ask");
+    assert.equal(evaluate("powershell", ["echo 'a'"], lists).decision, "allow");
+    assert.equal(evaluate("powershell", ["echo @\"a\"@"], lists).decision, "ask");
+  });
+  it("hasHeredoc is dialect-aware", () => {
+    assert.equal(hasHeredoc("cat <<EOF", "posix"), true);
+    assert.equal(hasHeredoc("cat <<EOF", "powershell"), false);
+    assert.equal(hasHeredoc("echo @'", "powershell"), true);
+    assert.equal(hasHeredoc("echo @'", "posix"), false);
+    assert.equal(hasHeredoc("echo hi < file", "posix"), false);
   });
 });
 

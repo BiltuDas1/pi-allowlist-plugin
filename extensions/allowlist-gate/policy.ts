@@ -32,6 +32,9 @@
  * - shell commands containing a redirection (`>`, `>>`, `2>`, `&>`, …): they
  *   can write files, so they always ask whatever the allowlist says. The check
  *   is deliberately coarse — a `>` inside quotes also asks.
+ * - shell commands containing a heredoc (`<<`) or, in PowerShell, a here-string
+ *   (`@'` / `@"`): the body is inert text the splitter cannot delimit, so a
+ *   quote inside it could hide the commands that follow from the allowlist.
  * - calls flagged `forceAsk` by the caller (paths outside the project).
  */
 
@@ -81,16 +84,25 @@ export const SAFE_PASSTHROUGH: ReadonlySet<string> = new Set([
 ]);
 
 /** Pi tool names carrying a shell command line. */
-const SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "powershell"]);
+export const SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "powershell"]);
 
 /** Pi tool names sharing the `edit` rule scope. */
-const EDIT_TOOLS: ReadonlySet<string> = new Set(["edit", "write"]);
+export const EDIT_TOOLS: ReadonlySet<string> = new Set(["edit", "write"]);
 
 /** Prefix/split markers of Pi MCP tool names (`mcp__<server>__<tool>`). */
 const MCP_PREFIX = "mcp__";
 const MCP_SEPARATOR = "__";
 
 const REDIRECTION = ">";
+
+/**
+ * Whether a shell command embeds a multi-line literal (posix heredoc `<<`,
+ * PowerShell here-string `@'` / `@"`). The coarse test is deliberate, like the
+ * redirection one: quoted occurrences ask too.
+ */
+export function hasHeredoc(text: string, shell: ShellKind): boolean {
+  return shell === "powershell" ? /@['"]/.test(text) : text.includes("<<");
+}
 
 /** Shell dialect for a Pi shell tool name. */
 export function shellKindOf(toolName: string): ShellKind {
@@ -99,14 +111,11 @@ export function shellKindOf(toolName: string): ShellKind {
 
 /**
  * Normalize an MCP server name for comparison, keeping `*`/`?` wildcards
- * intact so server patterns can use them. Dashes become underscores because
- * Pi accepts both spellings (`mcp__dev-radius` / `mcp__dev_radius`) and
- * tool names use the underscore form.
+ * intact so server patterns can use them. Every other character that is not a
+ * letter, digit or `_` (dashes included) becomes `_`, as in Pi tool names.
  */
 export function namespaceServer(server: string): string {
-  return String(server ?? "")
-    .replace(/-/g, "_")
-    .replace(/[^A-Za-z0-9_*?]/g, "_");
+  return String(server ?? "").replace(/[^A-Za-z0-9_*?]/g, "_");
 }
 
 export function parseRule(raw: string): ParsedRule | null {
@@ -136,10 +145,9 @@ export function normalizeCustomRule(entered: string, defaultScope: string): stri
   return trimmed;
 }
 
-
-// Standard wildcard semantics: `*` → `.*`, `?` → `.`,
-// plus the trailing " *" shorthand also matching the bare prefix. Like host paths,
-// matching is case-insensitive on Windows (case-insensitive file system).
+// Wildcard semantics: `*` → `.*`, `?` → `.`, plus the trailing " *" shorthand
+// (meant for shell commands) also matching the bare prefix. Matching is
+// case-insensitive on Windows (case-insensitive file system).
 export function wildcardMatch(input: string, pattern: string): boolean {
   const normalized = String(input).replaceAll("\\", "/");
   let escaped = String(pattern)
@@ -161,7 +169,11 @@ export function wildcardMatch(input: string, pattern: string): boolean {
  * them — and every inner command becomes a segment of its own, while the
  * enclosing segment keeps the raw substitution text. Single/double quotes and
  * the dialect's escape character (`\` in posix, backtick in PowerShell) are
- * respected so quoted separators do not split.
+ * respected so quoted separators do not split. Comments (`#` at the start of a
+ * word, PowerShell `<# … #>`) and posix `$'…'` strings are consumed verbatim:
+ * a quote inside them must not open a phantom string that swallows the commands
+ * following it. Heredocs are not parsed at all; they make the call ask instead
+ * (see {@link hasHeredoc}).
  *
  * The parser is deliberately conservative: when in doubt it splits more, so
  * the result can only make a command harder to allow, never easier.
@@ -182,6 +194,8 @@ function scan(text: string, start: number, closer: ")" | "`" | null, shell: Shel
   const backtickSubstitution = shell === "posix";
   let current = "";
   let i = start;
+  /** True at the start of a word: only there does `#` begin a comment. */
+  let wordStart = true;
 
   const flush = (): void => {
     const segment = current.trim();
@@ -204,6 +218,8 @@ function scan(text: string, start: number, closer: ")" | "`" | null, shell: Shel
       flush();
       return i + 1;
     }
+    const wasWordStart = wordStart;
+    wordStart = false;
     if (ch === escape && i + 1 < text.length) {
       current += ch + next;
       i += 2;
@@ -211,6 +227,25 @@ function scan(text: string, start: number, closer: ")" | "`" | null, shell: Shel
       i = substitute(i, i + 2, ")");
     } else if (ch === "`" && backtickSubstitution) {
       i = substitute(i, i + 1, "`");
+    } else if (ch === "#" && wasWordStart) {
+      // Line comment: inert up to the end of the line (the newline still splits).
+      const eol = text.indexOf("\n", i);
+      const end = eol === -1 ? text.length : eol;
+      current += text.slice(i, end);
+      i = end;
+    } else if (shell === "powershell" && ch === "<" && next === "#") {
+      // Block comment `<# … #>`; unterminated runs to the end of the input.
+      const close = text.indexOf("#>", i + 2);
+      const end = close === -1 ? text.length : close + 2;
+      current += text.slice(i, end);
+      i = end;
+    } else if (shell === "posix" && ch === "$" && next === "'") {
+      // ANSI-C string: unlike plain single quotes, `\'` does not end it.
+      let j = i + 2;
+      while (j < text.length && text[j] !== "'") j += text[j] === "\\" ? 2 : 1;
+      const end = Math.min(j + 1, text.length);
+      current += text.slice(i, end);
+      i = end;
     } else if (ch === "'") {
       // Single quotes: verbatim up to the next single quote, no substitutions.
       const close = text.indexOf("'", i + 1);
@@ -235,12 +270,15 @@ function scan(text: string, start: number, closer: ")" | "`" | null, shell: Shel
       if (i < text.length) current += text[i++]; // closing quote
     } else if (ch === "&" || ch === "|") {
       flush();
+      wordStart = true;
       i += next === ch ? 2 : 1; // `&&` / `||`
     } else if (ch === ";" || ch === "\n" || ch === "(" || ch === ")") {
       flush();
+      wordStart = true;
       i++;
     } else {
       current += ch;
+      wordStart = ch === " " || ch === "\t";
       i++;
     }
   }
@@ -353,7 +391,10 @@ export function evaluate(
   if (denied) return { decision: "deny" };
 
   if (options.forceAsk) return { decision: "ask" };
-  if (SHELL_TOOLS.has(toolName) && res.some((r) => r.includes(REDIRECTION))) return { decision: "ask" };
+  if (SHELL_TOOLS.has(toolName)) {
+    const shell = shellKindOf(toolName);
+    if (res.some((r) => r.includes(REDIRECTION) || hasHeredoc(r, shell))) return { decision: "ask" };
+  }
 
   const allowed =
     allow.some((rule) => rule.kind === "whole") ||
