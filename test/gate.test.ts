@@ -20,12 +20,16 @@ interface FakeCtx {
   ui: {
     selectCalls: Array<{ title: string; options: string[] }>;
     editorCalls: Array<{ title: string; prefill: string | undefined }>;
+    inputCalls: Array<{ title: string; placeholder: string | undefined }>;
     notifications: string[];
     /** Choice returned by the next dialogs. */
     nextChoice: string | undefined;
     /** Answer of the rules editor: receives the prefilled text, undefined = cancelled. */
     editorAnswer: (prefill: string | undefined) => string | undefined;
+    /** Answer of the "Deny with reason" input, undefined = cancelled. */
+    inputAnswer: (placeholder: string | undefined) => string | undefined;
     select(title: string, options: string[]): Promise<string | undefined>;
+    input(title: string, placeholder?: string, opts?: { signal?: AbortSignal }): Promise<string | undefined>;
     editor(title: string, prefill?: string): Promise<string | undefined>;
     notify(message: string): void;
   };
@@ -42,14 +46,21 @@ function makeCtx(cwd: string, hasUI: boolean, trusted = true): FakeCtx {
   const ui: FakeCtx["ui"] = {
     selectCalls: [],
     editorCalls: [],
+    inputCalls: [],
     notifications: [],
     nextChoice: undefined,
     editorAnswer: () => undefined,
+    inputAnswer: () => undefined,
     async select(title, options) {
       ui.selectCalls.push({ title, options });
       // Yield so that concurrent calls really interleave.
       await new Promise((resolve) => setImmediate(resolve));
       return ui.nextChoice;
+    },
+    async input(title, placeholder) {
+      ui.inputCalls.push({ title, placeholder });
+      await new Promise((resolve) => setImmediate(resolve));
+      return ui.inputAnswer(placeholder);
     },
     async editor(title, prefill) {
       ui.editorCalls.push({ title, prefill });
@@ -198,6 +209,7 @@ describe("allowlist gate", () => {
         "Allow for session",
         "Allow & save rule (project)...",
         "Deny",
+        "Deny with reason...",
       ]);
       // Not remembered: the same call asks again.
       await handler(bash("git push origin main"), uiCtx);
@@ -208,7 +220,12 @@ describe("allowlist gate", () => {
       const untrustedCtx = makeCtx(cwd, true, false);
       untrustedCtx.ui.nextChoice = "Deny";
       await handler(bash("git push origin main"), untrustedCtx);
-      assert.deepEqual(untrustedCtx.ui.selectCalls[0].options, ["Allow once", "Allow for session", "Deny"]);
+      assert.deepEqual(untrustedCtx.ui.selectCalls[0].options, [
+        "Allow once",
+        "Allow for session",
+        "Deny",
+        "Deny with reason...",
+      ]);
     });
 
     it("'Deny' (or dialog dismissal) blocks the call", async () => {
@@ -217,6 +234,47 @@ describe("allowlist gate", () => {
       assert.equal((await handler(bash("git push origin main"), uiCtx))?.block, true);
       uiCtx.ui.nextChoice = undefined; // dismissed
       assert.equal((await handler(bash("git push origin main"), uiCtx))?.block, true);
+    });
+
+    it("'Deny with reason...' asks for a text and forwards it as the block reason", async () => {
+      const uiCtx = makeCtx(cwd, true);
+      uiCtx.ui.nextChoice = "Deny with reason...";
+      uiCtx.ui.inputAnswer = () => "  no network installs\n in this repo  ";
+
+      const result = await handler(bash("git push origin main"), uiCtx);
+      assert.equal(result?.block, true);
+      assert.match(result?.reason ?? "", /git push origin main was denied by the user/);
+      // Whitespace is collapsed so the reason stays one readable line.
+      assert.match(result?.reason ?? "", /Reason: no network installs in this repo$/);
+      assert.equal(uiCtx.ui.inputCalls.length, 1);
+      assert.match(uiCtx.ui.inputCalls[0].title, /git push origin main/);
+      // Denying never remembers anything: the same call asks again.
+      assert.equal((await handler(bash("git push origin main"), uiCtx))?.block, true);
+      assert.equal(uiCtx.ui.inputCalls.length, 2);
+    });
+
+    it("'Deny with reason...' falls back to the plain denial when empty or cancelled", async () => {
+      for (const answer of [undefined, "", "   "]) {
+        const uiCtx = makeCtx(cwd, true);
+        uiCtx.ui.nextChoice = "Deny with reason...";
+        uiCtx.ui.inputAnswer = () => answer;
+
+        const result = await handler(bash("git push origin main"), uiCtx);
+        assert.equal(result?.block, true, String(answer));
+        assert.match(result?.reason ?? "", /was not approved by the user/, String(answer));
+        assert.doesNotMatch(result?.reason ?? "", /Reason:/, String(answer));
+      }
+    });
+
+    it("'Deny with reason...' is available even when a rule could never take effect", async () => {
+      const uiCtx = makeCtx(cwd, true);
+      uiCtx.ui.nextChoice = "Deny with reason...";
+      uiCtx.ui.inputAnswer = () => "the redirection would clobber out.txt";
+
+      const result = await handler(bash("echo hi > out.txt"), uiCtx);
+      assert.equal(result?.block, true);
+      assert.match(uiCtx.ui.selectCalls[0].title, /redirection/);
+      assert.match(result?.reason ?? "", /Reason: the redirection would clobber out\.txt/);
     });
 
     it("'Allow for session' covers identical calls only", async () => {

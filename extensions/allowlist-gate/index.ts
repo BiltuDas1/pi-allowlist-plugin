@@ -7,7 +7,9 @@
  * - denylist match → blocked, the model receives the reason
  * - anything else gated → a UI dialog asks for approval
  *   ("Allow once" / "Allow for session" / "Allow & save rule (project)..." /
- *   "Deny"); without a UI (print/JSON mode) gated calls are blocked fail-safe
+ *   "Deny" / "Deny with reason..."); "Deny with reason..." asks for a short
+ *   text that is forwarded to the model as the blocking reason. Without a UI
+ *   (print/JSON mode) gated calls are blocked fail-safe
  * - read-only tools (`read`, `grep`, `find`, `ls`, MCP resource tools, …) →
  *   never touched
  *
@@ -51,6 +53,7 @@ const ALLOW_ONCE = "Allow once";
 const ALLOW_SESSION = "Allow for session";
 const ALLOW_SAVE = "Allow & save rule (project)...";
 const DENY = "Deny";
+const DENY_WITH_REASON = "Deny with reason...";
 
 /** What the policy needs to know about one tool call. */
 interface CallTarget {
@@ -69,6 +72,7 @@ interface AskContext {
   isProjectTrusted(): boolean;
   ui: {
     select(title: string, options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined>;
+    input(title: string, placeholder?: string, opts?: { signal?: AbortSignal }): Promise<string | undefined>;
     editor(title: string, prefill?: string): Promise<string | undefined>;
     notify(message: string, type?: "info" | "warning" | "error"): void;
   };
@@ -103,6 +107,17 @@ function sessionKey(toolName: string, resources: string[]): string {
 
 function block(reason: string): ToolCallEventResult {
   return { block: true, reason };
+}
+
+/**
+ * Block reason for a user denial. The text typed in "Deny with reason..." is
+ * forwarded verbatim, collapsed to a single line; empty/cancelled input falls
+ * back to the plain denial message.
+ */
+function denialReason(call: string, typed: string | undefined): string {
+  const reason = (typed ?? "").replace(/\s+/g, " ").trim();
+  if (reason.length === 0) return `Blocked by ${EXTENSION_NAME}: ${call} was not approved by the user`;
+  return `Blocked by ${EXTENSION_NAME}: ${call} was denied by the user. Reason: ${reason}`;
 }
 
 /**
@@ -193,7 +208,7 @@ export default function allowlistGate(pi: ExtensionAPI): void {
     // outside the project): a saved rule could never take effect, so don't offer it.
     const options = [ALLOW_ONCE, ALLOW_SESSION];
     if (ctx.isProjectTrusted() && !hint) options.push(ALLOW_SAVE);
-    options.push(DENY);
+    options.push(DENY, DENY_WITH_REASON);
 
     const choice = await ctx.ui.select(`Allowlist gate: allow ${call}${where}?`, options, { signal: ctx.signal });
     if (choice === ALLOW_ONCE) return undefined;
@@ -202,7 +217,15 @@ export default function allowlistGate(pi: ExtensionAPI): void {
       return undefined;
     }
     if (choice === ALLOW_SAVE) return saveRules(ctx, toolName, resources);
-    return block(`Blocked by ${EXTENSION_NAME}: ${call} was not approved by the user`);
+    if (choice === DENY_WITH_REASON) {
+      const typed = await ctx.ui.input(
+        `Allowlist gate: reason for denying ${call}${where}? It is shown to the model`,
+        "Reason (optional; leave empty to deny without explanation)",
+        { signal: ctx.signal },
+      );
+      return block(denialReason(call, typed));
+    }
+    return block(denialReason(call, undefined));
   }
 
   // Approvals never outlive the session they were granted in.

@@ -16,11 +16,13 @@ anything else asks you for approval in a dialog. Enforcement lives in the extens
 |---|---|
 | Call matches the **allowlist** | Runs silently |
 | Call matches the **denylist** | Blocked, no dialog; the model receives the reason |
-| Anything else that can change things | A dialog asks: **Allow once** · **Allow for session** · **Allow & save rule (project)...** · **Deny** |
+| Anything else that can change things | A dialog asks: **Allow once** · **Allow for session** · **Allow & save rule (project)...** · **Deny** · **Deny with reason...** |
 | Read-only tools (`read`, `grep`, `find`, `ls`, MCP resource tools, …) | Never touched |
 | No UI available (print/JSON mode) | Gated calls are **blocked** (fail-safe) |
 
 Precedence: **deny wins over allow, allow wins over ask.** Dismissing the dialog counts as *Deny*.
+Denying **with a reason** sends your text to the model as the block reason, so it knows why and
+can pick a different approach instead of retrying blindly.
 
 ---
 
@@ -41,9 +43,10 @@ pi -e npm:pi-allowlist-plugin
 - **Silent passthrough**: Safe read-only tools (`read`, `grep`, `find`, `ls`) and allowlisted commands (`git status`, `git diff`, `cat`, etc.) execute immediately without prompts.
 - **Interactive approval**: When the agent attempts an unlisted command (e.g. `npm run build`, editing files, or calling an external MCP tool), Pi pauses and opens an interactive dialog:
   ```text
-  Allow once  ·  Allow for session  ·  Allow & save rule (project)...  ·  Deny
+  Allow once  ·  Allow for session  ·  Allow & save rule (project)...  ·  Deny  ·  Deny with reason...
   ```
 - **Allow & save**: Choosing *"Allow & save rule (project)..."* opens an editor prefilled with the exact rule (e.g. `shell:npm run build` or `edit:src/app.ts`), saving it directly to `<project>/.pi/allowlist-gate.json` for future runs.
+- **Deny with reason**: Choosing *"Deny with reason..."* opens a one-line input; the text you type becomes the error message the model receives (`… was denied by the user. Reason: <your text>`).
 - **Hard deny**: Denylisted patterns (e.g. `shell:rm -rf *`, `shell:npm publish *`, `mcp:github:delete_*`) are blocked immediately without prompting the user.
 
 ### 3. Key commands
@@ -82,7 +85,7 @@ Create `.pi/allowlist-gate.json` in your project root:
 - 📦 [**Installation Guide**](#installation) — npm, GitHub, local checkout, manual copy, and package management
 - 📜 [**Rule Syntax**](#rule-syntax) — Syntax specification, wildcards, shell command splitting, redirections (`>`), file edits, and [MCP servers & tools](#mcp-servers-and-tools)
 - ⚙️ [**Configuration**](#configuration) — Global (`~/.pi/agent/extensions/`) vs project configuration, defaults, and fail-safe loading
-- 💾 [**Session Approvals & Rule Saving**](#allow-for-session) — In-memory approvals and interactive rule editing
+- 💾 [**Session Approvals & Rule Saving**](#allow-for-session) — In-memory approvals, interactive rule editing, and [denying with a reason](#deny-with-reason)
 - 🔍 [**Inspection Command (`/allowlist`)**](#inspection-command-allowlist) — Live diagnostics and diagnostic report fields
 - ⚠️ [**Known Limitations**](#known-limitations) — Static analysis boundaries, wrappers (`sudo`, `bash -c`), and symlinks
 - 🛠️ [**Development & Contributing**](#development) — Running tests, architecture, and extension points
@@ -312,6 +315,24 @@ carries no resources (`my-tool:foo` → use `my-tool`), and a rule with no scope
 
 Session approvals exist **only in memory**: they match the exact same call (tool + target) and
 are dropped on every new/resumed/forked session and on reload.
+
+### "Deny with reason..."
+
+Plain **Deny** blocks the call with a generic message. **Deny with reason...** asks you for a
+short text first and forwards it to the model as the blocking reason:
+
+```text
+Blocked by allowlist-gate: bash npm install was denied by the user. Reason: dependencies are
+installed by hand in this repo
+```
+
+- The input is a single line; surrounding whitespace is trimmed and inner line breaks are
+  collapsed, so the reason always reads cleanly in the error message.
+- Leaving it empty (or pressing Escape) denies without explanation, exactly like plain **Deny**.
+- It is offered even where *"Allow & save rule (project)..."* is not (redirections, heredocs,
+  targets outside the project), because denying never needs a rule.
+- Nothing is remembered, and no rule is written: the same call asks again next time. The reason
+  is shown to the model only — it is neither logged by the extension nor persisted.
 
 ### "Allow & save rule (project)..."
 

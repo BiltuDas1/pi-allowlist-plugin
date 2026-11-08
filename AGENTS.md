@@ -48,7 +48,7 @@ test/
                     status report, saveProjectRules (seeding, inheritance, no overwrite), lintRules
   gate.test.ts    → handler wiring with fake Pi API/UI: allow/ask/deny, session approvals,
                     serialized dialogs, outside-project, redirections, MCP, trust, disabled gate,
-                    /allowlist command, "Allow & save rule" flow
+                    /allowlist command, "Allow & save rule" flow, "Deny with reason" flow
 ```
 
 `README.md` is the user-facing documentation (install, rules, config, limitations, contributing):
@@ -61,8 +61,13 @@ Main handler: `pi.on("tool_call", …)`. It derives `(toolName, resources)` from
 
 - allowlist match → return `undefined` (passes silently)
 - denylist match → `{ block: true, reason }` (no dialog; the model receives the reason)
-- anything else gated → `ctx.ui.select("Allow once" | "Allow for session" | "Allow & save rule (project)..." | "Deny")`
+- anything else gated → `ctx.ui.select("Allow once" | "Allow for session" | "Allow & save rule (project)..." | "Deny" | "Deny with reason...")`
   (the save option is offered only when `ctx.isProjectTrusted()`); dismissal counts as deny.
+  "Deny with reason..." asks for one line via `ctx.ui.input(title, placeholder)` and forwards it to
+  the model as the block reason (`denialReason()`: trimmed, whitespace collapsed to one line;
+  empty or cancelled input falls back to the plain denial message). It is always offered —
+  denying needs no rule, so it also appears for redirections, heredocs and outside-project
+  targets — and remembers nothing (the same call asks again).
   Without UI (`!ctx.hasUI`: print/JSON mode) gated calls are **blocked fail-safe**.
 - safe read-only tools → untouched (`undefined`, no dialog).
 
